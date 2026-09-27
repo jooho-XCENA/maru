@@ -630,21 +630,6 @@ bool PoolManager::hasPools() const
     return !pools_.empty();
 }
 
-int PoolManager::rescanIfEmpty()
-{
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!pools_.empty())
-    {
-        return 1;
-    }
-    int rc = rescanDevicesLocked();
-    if (rc != 0)
-    {
-        return rc;
-    }
-    return pools_.empty() ? 0 : 1;
-}
-
 int PoolManager::loadPoolsLocked()
 {
     std::vector<DeviceInfo> devices;
