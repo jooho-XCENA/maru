@@ -432,6 +432,26 @@ def _req_chunk_keys(req_meta: MaruReqMeta, chunk_tokens: int) -> list[str]:
     return req_meta._chunk_keys_memo
 
 
+def _validate_deferred_loading(enabled: bool) -> None:
+    """Require vLLM's receive-side block retention for cancelled loads."""
+    if not enabled:
+        return
+    import vllm
+    from packaging.version import InvalidVersion, Version
+
+    version = getattr(vllm, "__version__", "unknown")
+    try:
+        supported = Version(version) >= Version("0.16.0")
+    except InvalidVersion:
+        supported = False
+    if not supported:
+        raise ValueError(
+            f"maru_async_load requires vLLM >= 0.16.0 (found {version}); "
+            "upgrade vLLM or disable maru_async_load / "
+            "maru_enable_deferred_loading to keep cancelled KV loads safe."
+        )
+
+
 @dataclass
 class MaruConnectorMetadata(KVConnectorMetadata):
     """Metadata communicated from scheduler to worker each step."""
@@ -765,6 +785,7 @@ class MaruSchedulerConnector:
         # first forward pass. This is the mechanism vLLM itself calls async
         # loading — get_num_new_matched_tokens returns async_load=True.
         self._deferred_loading = bool(_get_knob(extra_config, "maru_async_load"))
+        _validate_deferred_loading(self._deferred_loading)
         self._write_behind = bool(_get_knob(extra_config, "maru_async_store"))
         self._use_layerwise = bool(extra_config.get("maru_use_layerwise", False))
         overlap_requested = bool(
@@ -1191,6 +1212,7 @@ class MaruWorkerConnector:
         num_kv_heads: int | None = None,
         head_size: int | None = None,
     ):
+        _validate_deferred_loading(bool(_get_knob(extra_config, "maru_async_load")))
         self._block_size = block_size
         self._kv_chunk_tokens = kv_chunk_tokens
         self._extra_config = extra_config
@@ -2574,10 +2596,13 @@ class MaruWorkerConnector:
         longer reads the GPU cache. Only the store stream must be complete at
         this boundary.
         """
+        # Parked receives have no new store reads; stores from before a
+        # preemption were drained at that preemption. Do not synchronize the
+        # shared store stream for recv-only aborts (it may serve other requests).
         self._recv_only_finished_req_ids.update(metadata.recv_only_finished_req_ids)
         if (
             self._write_behind
-            and (metadata.preempted_req_ids or metadata.recv_only_finished_req_ids)
+            and metadata.preempted_req_ids
             and self._store_stream is not None
         ):
             self._store_stream.synchronize()
