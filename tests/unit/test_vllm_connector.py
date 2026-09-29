@@ -4209,3 +4209,154 @@ class TestKvOpsResolution:
             )
             is None
         )
+
+
+class TestAbortDeferredWriteBehind:
+    """Exercise both completion channels against vLLM's scheduler consumer."""
+
+    @pytest.mark.parametrize("overlap", [False, True])
+    @pytest.mark.parametrize("write_behind", [False, True])
+    @pytest.mark.parametrize("timing", ["pending", "ready", "in_transit", "received"])
+    def test_abort_frees_once(self, overlap, write_behind, timing):
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.request import RequestStatus
+
+        from maru_vllm.connector import MaruKVConnector
+
+        config = {
+            "maru_async_load": True,
+            "maru_async_store": write_behind,
+            "maru_overlap_load_with_compute": overlap,
+        }
+        sched = make_scheduler(4, 8, config)
+        worker = make_worker(4, 8, config)
+        facade = SimpleNamespace(_worker=worker, _scheduler=sched)
+        request = SimpleNamespace(
+            request_id="r1",
+            prompt_token_ids=list(range(8)),
+            status=RequestStatus.WAITING_FOR_REMOTE_KVS,
+            client_index=0,
+            num_computed_tokens=0,
+        )
+        request.is_finished = lambda: RequestStatus.is_finished(request.status)
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([0, 1],)
+        sched._last_match_result["r1"] = 1
+        sched.update_state_after_alloc(request, blocks, 8)
+        sched.build_connector_meta(fake_scheduler_output())
+
+        engine = Scheduler.__new__(Scheduler)
+        state = SimpleNamespace(
+            connector=SimpleNamespace(
+                update_connector_output=lambda output: (
+                    MaruKVConnector.update_connector_output(facade, output)
+                )
+            ),
+            requests={"r1": request},
+            finished_recving_kv_req_ids=set(),
+            failed_recving_kv_req_ids=set(),
+            finished_req_ids=set(),
+            finished_req_ids_dict=None,
+            running=[],
+            waiting=MagicMock(),
+            skipped_waiting=MagicMock(),
+            encoder_cache_manager=MagicMock(),
+            kv_cache_manager=MagicMock(),
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[object()]),
+        )
+
+        engine.__dict__.update(vars(state))
+        engine.connector.request_finished = lambda req, ids: (
+            MaruKVConnector.request_finished(facade, req, ids)
+        )
+        engine.kv_cache_manager.get_block_ids.return_value = ([0, 1],)
+
+        def consume(result):
+            sending, recving = result
+            Scheduler._update_from_kv_xfer_finished(
+                engine,
+                SimpleNamespace(finished_sending=sending, finished_recving=recving),
+            )
+
+        early = (None, None)
+        if timing != "pending":
+            worker._deferred_done.add("r1")
+        if timing in ("in_transit", "received"):
+            early = MaruKVConnector.get_finished(facade, set())
+        if timing == "received":
+            consume(early)
+
+        # Use the actual cancellation/retention path, not a fixture that
+        # duplicates its delay_free_blocks decision.
+        engine.finish_requests("r1", RequestStatus.FINISHED_ABORTED)
+        assert request.status == RequestStatus.FINISHED_ABORTED
+        if timing != "received" or write_behind:
+            engine.kv_cache_manager.free.assert_not_called()
+            assert "r1" in engine.requests
+        if timing == "in_transit":
+            consume(early)
+
+        output = fake_scheduler_output()
+        output.finished_req_ids = set(engine.finished_req_ids)
+        metadata = sched.build_connector_meta(output)
+        worker.handle_preemptions(metadata)
+        result = MaruKVConnector.get_finished(facade, {"r1"})
+        if timing == "pending":
+            assert result == (None, None)  # No early send frees a live H2D target.
+            engine.kv_cache_manager.free.assert_not_called()
+            worker._deferred_done.add("r1")
+            result = MaruKVConnector.get_finished(facade, set())
+        consume(result)
+        consume(MaruKVConnector.get_finished(facade, set()))
+        engine.kv_cache_manager.free.assert_called_once_with(request)
+        assert not engine.requests
+        assert not worker._recv_only_finished_req_ids
+        assert not sched._awaiting_deferred_recv
+
+    def test_recv_only_abort_does_not_wait_for_unrelated_stores(self):
+        from maru_vllm.connector import MaruConnectorMetadata
+
+        worker = make_worker(4, 8, {"maru_async_store": True})
+        worker._store_stream = MagicMock()
+        worker.handle_preemptions(
+            MaruConnectorMetadata(recv_only_finished_req_ids={"r1"})
+        )
+        worker._store_stream.synchronize.assert_not_called()
+        # Keep the suppression until vLLM supplies its finished IDs, even if
+        # that happens later than the metadata notification.
+        assert worker.get_finished_saving(set()) is None
+        assert worker.get_finished_saving({"r1"}) is None
+        assert not worker._recv_only_finished_req_ids
+
+    def test_received_load_keeps_normal_write_behind_drain(self):
+        sched = make_scheduler(4, 8, {"maru_async_store": True})
+        worker = make_worker(4, 8, {"maru_async_store": True})
+        request = SimpleNamespace(request_id="r1")
+        sched._awaiting_deferred_recv.add("r1")
+        sched.update_connector_output(SimpleNamespace(finished_recving={"r1"}))
+        assert sched.request_finished(request, [0, 1]) == (True, None)
+        TestWriteBehindStoreLifecycle._reserve(worker)
+        assert worker.get_finished_saving({"r1"}) is None
+        worker._complete_write_behind_keys(["k1"], [True])
+        assert worker.get_finished_saving(set()) == {"r1"}
+
+
+@pytest.mark.parametrize("factory", [make_scheduler, make_worker])
+@pytest.mark.parametrize("knob", ["maru_async_load", "maru_enable_deferred_loading"])
+@pytest.mark.parametrize("version", ["0.14.0", "0.15.1", "0.16.0rc1", "unknown"])
+def test_deferred_loading_rejects_unsafe_vllm(monkeypatch, factory, knob, version):
+    import vllm
+
+    monkeypatch.setattr(vllm, "__version__", version)
+    with pytest.raises(ValueError, match="requires vLLM >= 0.16.0"):
+        factory(4, 8, {knob: True})
+    factory(4, 8, {knob: False})  # Synchronous loading retains older support.
+
+
+@pytest.mark.parametrize("factory", [make_scheduler, make_worker])
+@pytest.mark.parametrize("version", ["0.16.0", "0.16.0+local", "0.22.1rc1.dev31"])
+def test_deferred_loading_accepts_supported_vllm(monkeypatch, factory, version):
+    import vllm
+
+    monkeypatch.setattr(vllm, "__version__", version)
+    factory(4, 8, {"maru_async_load": True})
