@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "log.h"
@@ -57,6 +58,9 @@ class WalStore;
 /// Exposed for testing.
 bool parseRegionIndexFromDaxName(const std::string &devName, uint32_t &outIndex);
 
+/// True only for a sysfs DAX device bound to device_dax (not kmem/unbound).
+bool isDeviceDaxBound(const std::string &sysfsDevicePath);
+
 class PoolManager
 {
 public:
@@ -96,6 +100,7 @@ public:
     void clientReconnected(const std::string &clientId);
 
 private:
+    friend class PoolManagerTestPeer;
     struct DeviceInfo
     {
         uint32_t poolId;
@@ -109,6 +114,9 @@ private:
     // still happen and are idempotent.
     int buildPoolFromDevice(uint32_t poolId, const std::string &path,
                             DaxType type, PoolState &out);
+    int poolBuildFailed(const std::string &path, const char *stage, int error);
+    // Suppress only identical failures; every scan still retries the device.
+    std::map<std::string, std::pair<std::string, int>> failedDevices_;
     int loadPoolFromDevice(uint32_t poolId, const std::string &path,
                            DaxType type);
     int getDeviceSize(const std::string &path, uint64_t &sizeOut);
