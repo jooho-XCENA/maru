@@ -38,7 +38,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report-${{ matrix.python-version }}
+          # Keep the baseline compatible with main and PRs predating the matrix.
+          name: ${{ matrix.python-version == '3.12' && 'coverage-report' || format('coverage-report-{0}', matrix.python-version) }}
           path: |
             coverage.xml
             pytest.xml

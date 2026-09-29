@@ -8,10 +8,7 @@
 
 ## Running
 
-CI runs the core unit tests on Python 3.12, 3.13, and 3.14. Each version
-uploads its own coverage report; PR coverage comments use Python 3.12 as
-the baseline. SGLang tests and integration tests are excluded, and tests
-requiring optional dependencies may be skipped.
+CI runs the core unit tests on Python 3.12, 3.13, and 3.14. Each version uploads its own coverage report; Python 3.12 retains the `coverage-report` artifact name for PR comments, while newer versions use a version suffix. SGLang tests and integration tests are excluded, and tests requiring optional dependencies may be skipped.
 
 To reproduce a CI test run locally, choose a version from the matrix:
 
