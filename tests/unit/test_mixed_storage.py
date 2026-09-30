@@ -142,6 +142,21 @@ def test_mixed_close_cannot_return_cxl_while_an_exported_view_exists(server):
     assert server._allocation_manager.get_handle(region) is None
 
 
+def test_typed_cxl_pool_is_hidden_from_legacy_allocation_discovery(server):
+    legacy = server.request_alloc("legacy-owner", 128)
+    assert legacy is not None
+    client = mixed_client(server)
+    typed_region = client.pool.pools["cxl"]._handle.region_id
+    try:
+        visible = server.list_allocations(exclude_instance_id="legacy-reader")
+        assert [handle.region_id for handle in visible] == [legacy.region_id]
+        assert server._allocation_manager.get_handle(typed_region) is not None
+    finally:
+        client.close()
+        server.return_alloc("legacy-owner", legacy.region_id)
+    assert server._allocation_manager.get_handle(typed_region) is None
+
+
 def test_mixed_expiry_hides_both_media_without_reusing_live_cxl(server):
     client = mixed_client(server)
     try:

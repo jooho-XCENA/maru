@@ -46,7 +46,7 @@ class MaruServer:
         self.replica_directory = ReplicaDirectory(
             cpu_capacity_limit,
             cpu_session_ttl,
-            reserve_cxl=self.request_alloc if enable_cxl else None,
+            reserve_cxl=self._reserve_storage_region if enable_cxl else None,
             release_cxl=self._release_storage_region if enable_cxl else None,
         )
         # TODO: Add PinMonitor daemon thread when eviction is implemented.
@@ -85,6 +85,10 @@ class MaruServer:
         """Resource manager address used by this server."""
         return self._rm_address
 
+    def _reserve_storage_region(self, owner: str, size: int) -> MaruHandle | None:
+        """Reserve a typed pool without exposing it to legacy clients."""
+        return self.request_alloc(owner, size, legacy_visible=False)
+
     def _release_storage_region(self, owner: str, region_id: int) -> bool:
         """Idempotent release of a typed pool, after the owner unmaps it."""
         if self._allocation_manager.get_handle(region_id) is None:
@@ -95,7 +99,9 @@ class MaruServer:
     # Allocation Management
     # =========================================================================
 
-    def request_alloc(self, instance_id: str, size: int) -> MaruHandle | None:
+    def request_alloc(
+        self, instance_id: str, size: int, *, legacy_visible: bool = True
+    ) -> MaruHandle | None:
         """Handle allocation request from client.
 
         When ``--dax-path`` is configured, iterates over the server's
@@ -106,7 +112,17 @@ class MaruServer:
         dax_paths_iter = self._dax_paths if self._dax_paths else [""]
 
         for path in dax_paths_iter:
-            handle = self._allocation_manager.allocate(instance_id, size, dax_path=path)
+            if legacy_visible:
+                handle = self._allocation_manager.allocate(
+                    instance_id, size, dax_path=path
+                )
+            else:
+                handle = self._allocation_manager.allocate(
+                    instance_id,
+                    size,
+                    dax_path=path,
+                    legacy_visible=False,
+                )
             if handle:
                 logger.info(
                     "Allocated %d bytes for %s from %s: region_id=%d",
