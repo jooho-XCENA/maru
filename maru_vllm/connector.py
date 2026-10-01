@@ -531,6 +531,10 @@ class MaruReqMeta:
     num_matched_chunks: int = 0  # For load: how many chunks to load
     num_scheduled_tokens: int = 0  # For store: tokens covered this step
     num_computed_tokens: int = 0  # For store: tokens already computed before this step
+    # CPU/mixed external-token interval, excluding GPU hits and compute tail.
+    # None retains compatibility with metadata constructed without explicit bounds.
+    load_start_token: int = 0
+    load_end_token: int | None = None
     # For load: the request is parked in WAITING_FOR_REMOTE_KVS and the worker
     # loads between scheduler steps, reporting completion via get_finished().
     deferred_load: bool = False
@@ -957,6 +961,8 @@ class MaruSchedulerConnector:
         # Cached match results from get_num_new_matched_tokens,
         # consumed by update_state_after_alloc to avoid redundant RPC.
         self._last_match_result: dict[str, int] = {}
+        self._load_starts: dict[str, int] = {}
+        self._load_ranges: dict[str, tuple[int, int]] = {}
 
         # Requests that need continued store across chunked prefill steps.
         # req_id -> (full prompt token_ids, block ids accumulated from the
@@ -1077,6 +1083,7 @@ class MaruSchedulerConnector:
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
+        self._load_starts.pop(request.request_id, None)
         if self._cpu_mode and _cpu_bypass_request(request):
             self._cpu_bypass_requests.add(request.request_id)
             return 0, False
@@ -1121,6 +1128,8 @@ class MaruSchedulerConnector:
         # Cache the result so update_state_after_alloc can reuse it
         # without a redundant _count_matched_chunks call.
         self._last_match_result[request.request_id] = num_matched_chunks
+        if self._cpu_mode:
+            self._load_starts[request.request_id] = num_computed_tokens
 
         return new_matched, self._deferred_loading
 
@@ -1131,6 +1140,7 @@ class MaruSchedulerConnector:
         num_external_tokens: int,
     ):
         if num_external_tokens <= 0:
+            self._load_starts.pop(request.request_id, None)
             # Second call after a deferred load completed (extra blocks for
             # the tail). Packed layerwise overlap uses it as the scheduler-side
             # handoff: the next scheduled forward must activate the CXL views
@@ -1142,6 +1152,9 @@ class MaruSchedulerConnector:
                 self._deferred_layerwise_ready.add(request.request_id)
             return
         num_chunks = self._last_match_result.pop(request.request_id, 0)
+        if self._cpu_mode:
+            start = self._load_starts.pop(request.request_id, 0)
+            self._load_ranges[request.request_id] = (start, start + num_external_tokens)
         if self._deferred_loading:
             self._active_deferred_req_ids.add(request.request_id)
             self._awaiting_deferred_recv.add(request.request_id)
@@ -1207,6 +1220,7 @@ class MaruSchedulerConnector:
             if new_req.req_id in self._requests_need_load:
                 # Load cached chunks from maru
                 _, num_chunks = self._requests_need_load[new_req.req_id]
+                load_start, load_end = self._load_ranges.get(new_req.req_id, (0, None))
                 meta.requests.append(
                     MaruReqMeta(
                         req_id=new_req.req_id,
@@ -1217,6 +1231,8 @@ class MaruSchedulerConnector:
                         block_ids=new_req.block_ids[0],
                         is_store=False,
                         num_matched_chunks=num_chunks,
+                        load_start_token=load_start,
+                        load_end_token=load_end,
                     )
                 )
             else:
@@ -1280,6 +1296,8 @@ class MaruSchedulerConnector:
                         block_ids=new_block_ids[0],
                         is_store=False,
                         num_matched_chunks=num_chunks,
+                        load_start_token=self._load_ranges.get(req_id, (0, None))[0],
+                        load_end_token=self._load_ranges.get(req_id, (0, None))[1],
                     )
                 )
             elif req_id in self._requests_need_store:
@@ -1317,6 +1335,8 @@ class MaruSchedulerConnector:
         if scheduler_output.preempted_req_ids:
             stale_ids = stale_ids | scheduler_output.preempted_req_ids
         for rid in stale_ids:
+            self._load_starts.pop(rid, None)
+            self._load_ranges.pop(rid, None)
             self._cpu_bypass_requests.discard(rid)
             self._requests_need_store.pop(rid, None)
             self._requests_need_load.pop(rid, None)
@@ -1327,6 +1347,7 @@ class MaruSchedulerConnector:
             self._deferred_layerwise_ready.discard(rid)
 
         self._requests_need_load.clear()
+        self._load_ranges.clear()
         return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -1806,6 +1827,15 @@ class MaruWorkerConnector:
 
             # Packed (default): one key per chunk (num_chunks keys). Layerwise:
             # one key per (chunk, layer), layer-major (num_chunks x num_layers).
+            if self._cpu_mode:
+                start, end = self._cpu_load_range(req_meta)
+                first_chunk = start // self._kv_chunk_tokens
+                last_chunk = (end + self._kv_chunk_tokens - 1) // self._kv_chunk_tokens
+                if last_chunk > num_chunks:
+                    self._fail_deferred_load(req_meta)
+                    continue
+                chunk_keys = chunk_keys[first_chunk:last_chunk]
+                num_chunks = len(chunk_keys)
             keys = _load_keys(chunk_keys, num_chunks, layers, self._use_layerwise)
             try:
                 _t0 = time.monotonic()
@@ -2638,10 +2668,10 @@ class MaruWorkerConnector:
         The request's blocks are reported through
         ``get_block_ids_with_load_errors`` (vLLM resets its computed-token
         count) and the request id through ``get_finished_loading`` (vLLM
-        unparks it from WAITING_FOR_REMOTE_KVS). Inline loads need neither —
-        the sync path simply recomputes.
+        unparks it from WAITING_FOR_REMOTE_KVS). CPU/mixed inline loads
+        also report errors, but only for their externally allocated blocks.
         """
-        if self._cpu_mode and not req_meta.is_store and req_meta.num_matched_chunks > 0:
+        if self._cpu_mode and not req_meta.is_store:
             self._fail_load(
                 req_meta, RuntimeError("CPU replica unavailable during load")
             )
@@ -2651,6 +2681,15 @@ class MaruWorkerConnector:
         with self._deferred_lock:
             self._failed_load_blocks.update(req_meta.block_ids)
             self._deferred_done.add(req_meta.req_id)
+
+    def _cpu_load_range(self, req_meta: MaruReqMeta) -> tuple[int, int]:
+        """Only externally allocated tokens may be copied or invalidated."""
+        end = req_meta.load_end_token
+        if end is None:
+            end = req_meta.num_matched_chunks * self._kv_chunk_tokens
+        return req_meta.load_start_token, min(
+            end, len(req_meta.block_ids) * self._block_size
+        )
 
     def _fail_load(self, req_meta: MaruReqMeta, exc: Exception) -> None:
         """Contain one request's load failure instead of letting it raise.
@@ -2666,7 +2705,14 @@ class MaruWorkerConnector:
             "Maru load failed for req %s (%s); recomputing", req_meta.req_id, exc
         )
         with self._deferred_lock:
-            self._failed_load_blocks.update(req_meta.block_ids)
+            blocks = req_meta.block_ids
+            if self._cpu_mode:
+                start, end = self._cpu_load_range(req_meta)
+                blocks = blocks[
+                    start // self._block_size : (end + self._block_size - 1)
+                    // self._block_size
+                ]
+            self._failed_load_blocks.update(blocks)
             if req_meta.deferred_load:
                 self._deferred_done.add(req_meta.req_id)
 
@@ -2973,12 +3019,23 @@ class MaruWorkerConnector:
                     slot_gpu = slot_mapping.to(dev, non_blocking=use_stream)
                     for ci in range(num_chunks):
                         slab_view = slab_infos[ci].view
-                        chunk_slots = slot_gpu[ci * ct : (ci + 1) * ct]
+                        chunk_index = ci
+                        if self._cpu_mode:
+                            start, end = self._cpu_load_range(req_meta)
+                            chunk_index += start // ct
+                        chunk_slots = slot_gpu[
+                            chunk_index * ct : (chunk_index + 1) * ct
+                        ]
                         # KV_2LTD host tensor aliasing pinned CXL:
                         # [2, L, tokens, h]
                         slab_host = torch.frombuffer(slab_view, dtype=dtype).view(
                             2, num_layers, ct, -1
                         )
+                        if self._cpu_mode:
+                            lo = max(start - chunk_index * ct, 0)
+                            hi = min(end - chunk_index * ct, ct)
+                            chunk_slots = chunk_slots[lo:hi]
+                            slab_host = slab_host[:, :, lo:hi]
                         if kernel is not None:
                             ops, ptrs, pbs, block_size, head_size, fmt = kernel
                             ops.multi_layer_kv_transfer(

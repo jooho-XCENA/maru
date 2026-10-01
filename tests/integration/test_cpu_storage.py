@@ -216,7 +216,7 @@ def test_connector_roundtrip_and_lost_hit_recomputes(cpu_server, device):
         # The worker session disappears after scheduler discovery.
         worker._handler.close()
         worker.start_load_kv(context, load)
-        assert worker.take_failed_load_blocks() == {2, 3}
+        assert worker.take_failed_load_blocks() == {2}
         assert scheduler._count_matched_chunks(tokens) == 0
     finally:
         worker.shutdown()
